@@ -1,10 +1,12 @@
 #define WINVER 0x0601
 #define _WIN32_WINNT 0x0601
 #define WM_MY_ADMIN_MSG (WM_USER + 100)
+#define PROCESS_TERMINATE 0x0001
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <cstring>
+#include <aclapi.h>
 
 #ifndef NTAPI
 #define NTAPI __stdcall
@@ -249,6 +251,97 @@ BOOL ElevateSelf() {
 
 //--------------------------------------------------------------------
 
+// ProcessProtector---------------------------------------------------
+
+BOOL EnableSelfProcessGuard(void)
+{
+    HANDLE hProcess = GetCurrentProcess();
+    PACL pOldDACL = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+
+    DWORD err = GetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION, NULL, NULL,
+        &pOldDACL, NULL, &pSD);
+    if (err != ERROR_SUCCESS)
+    {
+        if(pSD) LocalFree(pSD);
+        return FALSE;
+    }
+
+    EXPLICIT_ACCESSA ea = {0};
+    ea.grfAccessPermissions = PROCESS_TERMINATE;
+    ea.grfAccessMode = DENY_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+
+    SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
+    PSID pEveryone = NULL;
+    if (!AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID,
+        0,0,0,0,0,0,0, &pEveryone))
+    {
+        LocalFree(pSD);
+        return FALSE;
+    }
+
+    ea.Trustee.ptstrName = (LPSTR)pEveryone;
+    PACL pNewDACL = NULL;
+
+    DWORD err2 = SetEntriesInAclA(1, &ea, pOldDACL, &pNewDACL);
+    FreeSid(pEveryone);
+    LocalFree(pSD);
+
+    if(err2 != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    DWORD err3 = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION, NULL, NULL, pNewDACL, NULL);
+    LocalFree(pNewDACL);
+
+    return (err3 == ERROR_SUCCESS);
+}
+
+BOOL DisableSelfProcessGuard(void)
+{
+    HANDLE hProcess = GetCurrentProcess();
+    PSID pEveryone = NULL;
+    SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
+
+    if (!AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID,
+        0,0,0,0,0,0,0, &pEveryone))
+    {
+        return FALSE;
+    }
+
+    EXPLICIT_ACCESSA ea2 = {0};
+    ea2.grfAccessPermissions = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION |
+                               SYNCHRONIZE | READ_CONTROL;
+    ea2.grfAccessMode = SET_ACCESS;
+    ea2.grfInheritance = NO_INHERITANCE;
+    ea2.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea2.Trustee.ptstrName = (LPSTR)pEveryone;
+
+    PACL pNewDACL = NULL;
+    DWORD err = SetEntriesInAclA(1, &ea2, NULL, &pNewDACL);
+    FreeSid(pEveryone);
+
+    if(err != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    DWORD err2 = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION, NULL, NULL, pNewDACL, NULL);
+    LocalFree(pNewDACL);
+
+    return (err2 == ERROR_SUCCESS);
+}
+
+//--------------------------------------------------------------------
+
+// Unlocker-------------------------------------------------------------
+
 void UnlockSystemPrograms()
 {
     HKEY retKey;
@@ -474,11 +567,30 @@ void RemoveNetworkRestrictions()
     printf("[Debug]网络解禁完成\n");
 }
 
-//-----------------------------
+void SetUacMaxLevel()
+{
+    HKEY hKey;
+	if(RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+	    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+	    0,KEY_WRITE,&hKey)==ERROR_SUCCESS)
+	{
+	    DWORD v;
+	    v=1; RegSetValueExA(hKey,"EnableLUA",0,REG_DWORD,(BYTE*)&v,sizeof(DWORD));
+	    v=2; RegSetValueExA(hKey,"ConsentPromptBehaviorAdmin",0,REG_DWORD,(BYTE*)&v,sizeof(DWORD));
+	    v=3; RegSetValueExA(hKey,"ConsentPromptBehaviorUser",0,REG_DWORD,(BYTE*)&v,sizeof(DWORD));
+	    v=1; RegSetValueExA(hKey,"PromptOnSecureDesktop",0,REG_DWORD,(BYTE*)&v,sizeof(DWORD));
+	    v=1; RegSetValueExA(hKey,"FilterAdministratorToken",0,REG_DWORD,(BYTE*)&v,sizeof(DWORD));
+	    RegCloseKey(hKey);
+	}
+    printf("[Debug]UAC已开启\n");
+}
+
+//------------------------------------------------
 void hSysUlocker(){
 	UnlockSystemPrograms();
 	RemoveUSBRestrictions();
 	RemoveNetworkRestrictions();
+	SetUacMaxLevel();
 	printf("\n[Debug]全部操作执行完毕\n");
 	/*old
 	HKEY hKey;
@@ -500,6 +612,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
     (void)hPrev;
     (void)cmdLine;
     (void)show;
+    
+    EnableSelfProcessGuard(); // 开启守护(作用不大)
     hSysUlocker();
     
     if (!IsAdmin())
@@ -507,7 +621,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
 	    int nRet = MessageBoxW(NULL,
 	        L"当前未使用管理员权限运行，部分操作可能会执行失败，\n是否尝试提权？",
 	        L"警告",
-	        MB_YESNO | MB_ICONQUESTION);
+	        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
 	
 	    if(nRet == IDYES)
 	    {
@@ -524,7 +638,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
      int nRet = MessageBoxW(NULL,
 	        L"启用 SeDebugPrivilege 失败！\n无管理员权限将无法继续操作! \n \n是否立即尝试提权？",
 			L"错误",
-	        MB_YESNO | MB_ICONERROR);
+	        MB_YESNO | MB_ICONERROR | MB_TOPMOST);
 	
 	    if(nRet == IDYES)
 	    {
@@ -536,11 +650,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
     DWORD rootPid = FindRootPid(targetExe);
     if (rootPid == 0)
     {
-        MessageBoxW(NULL,
-            L"未找到 zmserv.exe\n当前机房管理助手可能尚未加载完毕，提前结束可能会导致系统蓝屏\n(原因是新版机房管理助手调用了SeDebugPrivilege将自己设为系统进程，请不要尝试在任务管理器中结束)。\n \n也有可能你已经结束了机房管理助手，只是右下角托盘图标未刷新，你可以将鼠标放上去验证。\n \n目前已为你解除文件夹选项等系统限制，如果你有能力，\n你已经可以在资源管理器中查看机房管理助手的目录并执行一些操作了。",
+        int nRet = MessageBoxW(NULL,
+            L"未找到 zmserv.exe\n当前机房管理助手可能尚未加载完毕，提前结束可能会导致系统蓝屏\n(原因是新版机房管理助手调用了SeDebugPrivilege将自己设为系统进程，请不要尝试在任务管理器中结束)。\n \n也有可能你已经结束了机房管理助手，只是右下角托盘图标未刷新，你可以将鼠标放上去验证。\n \n你想尝试现在立刻结束掉机房管理助手的其他进程吗？\n该操作具有风险，请谨慎考虑。",
             L"悲/喜报 - By Hyrvex",
-            MB_ICONINFORMATION);
-        return 1;
+            MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST);
+        if(nRet == IDNO)
+		{
+		MessageBoxW(NULL,
+		    L"目前已为你解除文件夹选项等系统限制，如果你有能力，\n你已经可以在资源管理器中查看机房管理助手的目录并执行一些操作了。",
+		    L"悲/喜报 - By Hyrvex",
+		    MB_ICONINFORMATION | MB_TOPMOST);
+		return 1;
+		}
     }
 
     AddPid(rootPid);
@@ -555,7 +676,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
         MessageBoxW(NULL,
             L"获取 NtSetInformationProcess 地址失败！",
             L"错误",
-            MB_ICONERROR);
+            MB_ICONERROR | MB_TOPMOST);
         return 1;
     }
 
@@ -575,10 +696,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
     }
     else
     {
-        MessageBoxW(NULL,
+        /*MessageBoxW(NULL,
             L"部分进程标记清除失败！继续终止存在蓝屏风险！",
             L"警告",
-            MB_ICONWARNING);
+            MB_ICONWARNING);*/
     }
 
     BOOL allTerm = TRUE;
@@ -608,5 +729,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
 	Sleep(1000);
 	system("start explorer.exe");
 	//MessageBoxW(NULL,L"成功杀死机房管理助手主进程，现在你可以继续进行其他操作了，部分程序可能需要重新打开。",L"成功 - By Hyrvex",MB_ICONINFORMATION);
+	DisableSelfProcessGuard();
     return 0;
 }

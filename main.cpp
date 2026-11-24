@@ -1,10 +1,22 @@
 #define WINVER 0x0601
 #define _WIN32_WINNT 0x0601
-
+#define WM_MY_ADMIN_MSG (WM_USER + 100)
 #include <windows.h>
 #include <tlhelp32.h>
+#include <stdio.h>
+#include <cstring>
 
+#ifndef NTAPI
+#define NTAPI __stdcall
+#endif
 typedef LONG NTSTATUS;
+#ifndef S_OK
+#define S_OK ((HRESULT)0L)
+#endif
+
+#define ARRAYSIZE(arr)  (sizeof(arr)/sizeof((arr)[0]))
+#define KILL_FORCE   1
+#define KILL_DEFAULT 2
 
 typedef enum _PROCESSINFOCLASS
 {
@@ -149,7 +161,326 @@ static BOOL TerminateTarget(DWORD pid)
     return ok;
 }
 
+// fltuser.h--------------------------------------------------------------------
+
+typedef HRESULT (WINAPI *PFN_FilterConnectCommunicationPort)(
+    LPCWSTR, DWORD, LPCVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
+typedef HRESULT (WINAPI *PFN_FilterSendMessage)(HANDLE, LPVOID, DWORD, LPVOID, DWORD, LPDWORD);
+
+static PFN_FilterConnectCommunicationPort pFilterConnect = NULL;
+static PFN_FilterSendMessage          pFilterSend    = NULL;
+static HMODULE                         hFltLib        = NULL;
+
+static void LoadFltLib()
+{
+    if(hFltLib) return;
+    hFltLib = LoadLibraryA("FltLib.dll");
+    if(hFltLib)
+    {
+        pFilterConnect = (PFN_FilterConnectCommunicationPort)GetProcAddress(hFltLib, "FilterConnectCommunicationPort");
+        pFilterSend = (PFN_FilterSendMessage)GetProcAddress(hFltLib, "FilterSendMessage");
+    }
+}
+
+DWORD GetProcessIDFromName(LPCSTR szName)
+{
+    DWORD pid = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if(hSnap != INVALID_HANDLE_VALUE)
+    {
+        PROCESSENTRY32 pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32);
+        if(Process32First(hSnap, &pe32))
+        {
+            do
+            {
+                if(_stricmp(pe32.szExeFile, szName) == 0)
+                {
+                    pid = pe32.th32ProcessID;
+                    break;
+                }
+            }while(Process32Next(hSnap, &pe32));
+        }
+        CloseHandle(hSnap);
+    }
+    return pid;
+}
+
+BOOL KillProcess(DWORD dwProcessID, int way)
+{
+    if(dwProcessID == 0) return FALSE;
+    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, dwProcessID);
+    if(!hProc) return FALSE;
+    BOOL ret = TerminateProcess(hProc, 0);
+    CloseHandle(hProc);
+    return ret;
+}
+
+//--------------------------------------------------------------------
+
+// isAdmin------------------------------------------------------------
+
+BOOL IsAdmin() {
+    BOOL bIsAdmin = FALSE;
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+    PSID pAdminSID = NULL;
+
+    if (AllocateAndInitializeSid(&NtAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &pAdminSID))
+    {
+        CheckTokenMembership(NULL, pAdminSID, &bIsAdmin);
+        FreeSid(pAdminSID);
+    }
+    return bIsAdmin;
+}
+
+BOOL ElevateSelf() {
+    TCHAR szPath[MAX_PATH];
+    if (GetModuleFileName(NULL, szPath, MAX_PATH) == 0) {
+        return FALSE;
+    }
+    SHELLEXECUTEINFO sei = { sizeof(SHELLEXECUTEINFO) };
+    sei.lpVerb = TEXT("runas");
+    sei.lpFile = szPath;
+    sei.nShow = SW_SHOWNORMAL;
+    return ShellExecuteEx(&sei);
+}
+
+//--------------------------------------------------------------------
+
+void UnlockSystemPrograms()
+{
+    HKEY retKey;
+    LONG ret;
+    DWORD value = 0, out = 0, cb;
+    char szPath[BUFSIZ];
+
+    typedef struct{
+        LPCSTR regPath;
+        struct { LPCSTR valName; } items[16];
+        int itemCnt;
+    } RegTask;
+
+    RegTask hkcuTasks[] =
+    {
+        {"SOFTWARE\\Policies\\Microsoft\\Windows\\System", {{"DisableCMD"}},1},
+        {"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            {{"DisableRegistryTools"},{"DisableTaskMgr"},{"DisableLockWorkstation"},{"DisableChangePassword"},{"DisableSwitchUserOption"}},5},
+        {"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+            {{"NoRun"},{"RestrictRun"},{"NoLogOff"},{"StartMenuLogOff"},{"NoTrayContextMenu"},{"Hidden"},{"NoFolderOptions"}},7},
+        {"SOFTWARE\\Policies\\Microsoft\\MMC",{{"RestrictToPermittedSnapins"}},1},
+        {"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Zones\\3",{{"1803"},{"2200"}},2}
+    };
+
+    for(size_t ti=0;ti<ARRAYSIZE(hkcuTasks);ti++)
+    {
+        RegTask* p = &hkcuTasks[ti];
+        ret = RegOpenKeyExA(HKEY_CURRENT_USER, p->regPath,0,KEY_QUERY_VALUE|KEY_SET_VALUE,&retKey);
+        if(ret!=ERROR_SUCCESS) continue;
+        for(int i=0;i<p->itemCnt;i++)
+        {
+            cb=sizeof(DWORD);
+            ret=RegQueryValueExA(retKey,p->items[i].valName,0,NULL,(BYTE*)&out,&cb);
+            if(ret==ERROR_SUCCESS && out!=0)
+                RegSetValueExA(retKey,p->items[i].valName,0,REG_DWORD,(CONST BYTE*)&value,sizeof(DWORD));
+        }
+        RegCloseKey(retKey);
+    }
+
+    RegTask hklmUsbTasks[] =
+    {
+        {"SYSTEM\\CurrentControlSet\\Services\\usbstor",{{"Start"}},1},
+        {"SYSTEM\\ControlSet001\\Services\\usbstor",{{"Start"}},1},
+        {"SYSTEM\\ControlSet002\\Services\\usbstor",{{"Start"}},1},
+        {"SYSTEM\\ControlSet003\\Services\\usbstor",{{"Start"}},1},
+    };
+    value = 3;
+    for(size_t ti=0;ti<ARRAYSIZE(hklmUsbTasks);ti++)
+    {
+        RegTask* p = &hklmUsbTasks[ti];
+        ret = RegOpenKeyExA(HKEY_LOCAL_MACHINE, p->regPath,0,KEY_QUERY_VALUE|KEY_SET_VALUE,&retKey);
+        if(ret!=ERROR_SUCCESS) continue;
+        cb=sizeof(DWORD);
+        ret=RegQueryValueExA(retKey,p->items[0].valName,0,NULL,(BYTE*)&out,&cb);
+        if(ret==ERROR_SUCCESS && out==4)
+            RegSetValueExA(retKey,p->items[0].valName,0,REG_DWORD,(CONST BYTE*)&value,sizeof(DWORD));
+        RegCloseKey(retKey);
+    }
+
+    const char* images[]={
+        "taskkill.exe","ntsd.exe","tasklist.exe","sethc.exe","sidebar.exe",
+        "Chess.exe","FreeCell.exe","Hearts.exe","Minesweeper.exe","PurblePlace.exe",
+        "Mahjong.exe","SpiderSolitaire.exe","bckgzm.exe","chkrzm.exe","shvlzm.exe",
+        "Solitaire.exe","winmine.exe","Magnify.exe","QQPCTray.exe"
+    };
+    for(size_t i=0;i<ARRAYSIZE(images);i++)
+    {
+        sprintf(szPath,"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\%s",images[i]);
+        ret=RegOpenKeyExA(HKEY_LOCAL_MACHINE,szPath,0,KEY_SET_VALUE,&retKey);
+        if(ret==ERROR_SUCCESS){
+            RegDeleteValueA(retKey,"debugger");
+            RegCloseKey(retKey);
+        }
+    }
+
+    typedef struct{
+        LPCSTR regPath;
+        struct { LPCSTR valName; } items[16];
+        int itemCnt;
+    } RegDelTask;
+
+    RegDelTask delTasks[]=
+    {
+        {"SOFTWARE\\Policies\\Google\\Chrome",{{"AllowDinosaurEasterEgg"},{"DownloadRestrictions"},{"SaveAs"},{"DeveloperToolsAvailability"}},4},
+        {"SOFTWARE\\Policies\\Microsoft\\Edge",{{"AllowSurfGame"},{"WebWidgetAllowed"},{"DownloadRestrictions"},{"SaveAs"},{"DeveloperToolsAvailability"}},5},
+        {"SOFTWARE\\Policies\\Mozilla\\Firefox",{{"DisableDownloads"},{"BlockAboutDownloads"},{"DeveloperToolsAvailability"}},3},
+        {"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",{{"AllowMultipleTSSessions"}},1},
+        {"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",{{"HideFastUserSwitching"}},1},
+        {"SOFTWARE\\Policies\\Microsoft\\WindowsStore",{{"RemoveWindowsStore"}},1}
+    };
+
+    for(size_t ti=0;ti<ARRAYSIZE(delTasks);ti++)
+    {
+        RegDelTask* p=&delTasks[ti];
+        ret=RegOpenKeyExA(HKEY_LOCAL_MACHINE,p->regPath,0,KEY_SET_VALUE,&retKey);
+        if(ret!=ERROR_SUCCESS) continue;
+        for(int i=0;i<p->itemCnt;i++)
+            RegDeleteValueA(retKey,p->items[i].valName);
+        RegCloseKey(retKey);
+    }
+
+    ret=RegOpenKeyExA(HKEY_CURRENT_USER,"Software\\Policies\\Microsoft\\Internet Explorer\\Restrictions",0,KEY_SET_VALUE,&retKey);
+    if(ret==ERROR_SUCCESS){ RegDeleteValueA(retKey,"NoBrowserSaveAs"); RegCloseKey(retKey); }
+
+    ret=RegOpenKeyExA(HKEY_CURRENT_USER,"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",0,KEY_SET_VALUE,&retKey);
+    if(ret==ERROR_SUCCESS){ RegDeleteValueA(retKey,"ShowTaskViewButton"); RegCloseKey(retKey); }
+
+    ret=RegOpenKeyExA(HKEY_LOCAL_MACHINE,"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout",0,KEY_SET_VALUE,&retKey);
+    if(ret==ERROR_SUCCESS){ RegDeleteValueA(retKey,"Scancode Map"); RegCloseKey(retKey); }
+
+    const char* path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+    char tempPath[MAX_PATH];
+    sprintf(tempPath,"%s.tmp",path);
+
+    bool bHandled = false;
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hTemp = CreateFileA(tempPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(hFile != INVALID_HANDLE_VALUE && hTemp != INVALID_HANDLE_VALUE)
+    {
+        char buf[4096];
+        DWORD read;
+        char line[2048];
+        memset(line,0,sizeof(line));
+        int linePos=0;
+        while(ReadFile(hFile, buf, sizeof(buf), &read, NULL) && read>0)
+        {
+            for(DWORD i=0;i<read;i++)
+            {
+                if(buf[i]=='\n')
+                {
+                    line[linePos] = 0;
+                    if(strstr(line,"127.0.0.1")!=line || strspn(line," \t")<strstr(line,"127.0.0.1")-line)
+                    {
+                        strcat(line,"\r\n");
+                        DWORD wr;
+                        WriteFile(hTemp, line, (DWORD)strlen(line), &wr, NULL);
+                    }else{
+                        bHandled = true;
+                    }
+                    memset(line,0,sizeof(line));
+                    linePos=0;
+                }else{
+                    if(linePos < (int)sizeof(line)-2)
+                        line[linePos++] = buf[i];
+                }
+            }
+        }
+        if(linePos>0)
+        {
+            line[linePos]=0;
+            if(strstr(line,"127.0.0.1")!=line || strspn(line," \t")<strstr(line,"127.0.0.1")-line)
+            {
+                DWORD wr;
+                WriteFile(hTemp, line, (DWORD)strlen(line), &wr, NULL);
+            }else bHandled=true;
+        }
+        CloseHandle(hFile);
+        CloseHandle(hTemp);
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        DeleteFileA(path);
+        if(bHandled) MoveFileA(tempPath, path);
+    }
+    printf("[Debug]注册表解禁完成\n");
+}
+
+void RemoveUSBRestrictions()
+{
+    LoadFltLib();
+    if(pFilterConnect && pFilterSend)
+    {
+        HANDLE hPort = NULL;
+        HRESULT hr = pFilterConnect(L"\\TDFileFilterPort",0,NULL,0,NULL,&hPort);
+        if(SUCCEEDED(hr) && hPort != NULL)
+        {
+            int lpInBuffer[4]={8,0,0,0};
+            pFilterSend(hPort, lpInBuffer,16,NULL,0,NULL);
+            CloseHandle(hPort);
+        }
+    }
+
+    SC_HANDLE sc = OpenSCManagerA(NULL,NULL,SC_MANAGER_CONNECT);
+    if(sc != NULL)
+    {
+        SC_HANDLE hFilt = OpenServiceA(sc,"TDFileFilter", SERVICE_STOP|DELETE);
+        SERVICE_STATUS ss={0};
+        if(hFilt != NULL)
+        {
+            ControlService(hFilt,SERVICE_CONTROL_STOP,&ss);
+            DeleteService(hFilt);
+            CloseServiceHandle(hFilt);
+        }
+        CloseServiceHandle(sc);
+    }
+    printf("[Debug]U盘解禁完成\n");
+}
+
+void RemoveNetworkRestrictions()
+{
+    HANDLE hNetFilter = CreateFileA("\\\\.\\TDNetFilter", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,0,NULL);
+    if(hNetFilter != INVALID_HANDLE_VALUE)
+    {
+        DWORD junk;
+        DeviceIoControl(hNetFilter,0x120014,NULL,0,NULL,0,&junk,NULL);
+        CloseHandle(hNetFilter);
+    }
+
+    KillProcess(GetProcessIDFromName("MasterHelper.exe"), KILL_DEFAULT);
+    KillProcess(GetProcessIDFromName("GATESRV.exe"), KILL_DEFAULT);
+
+    SC_HANDLE sc = OpenSCManagerA(NULL,NULL,SC_MANAGER_CONNECT);
+    if(sc != NULL)
+    {
+        SC_HANDLE hFilt = OpenServiceA(sc,"TDNetFilter", SERVICE_STOP|DELETE);
+        SERVICE_STATUS ss={0};
+        if(hFilt != NULL)
+        {
+            ControlService(hFilt,SERVICE_CONTROL_STOP,&ss);
+            DeleteService(hFilt);
+            CloseServiceHandle(hFilt);
+        }
+        CloseServiceHandle(sc);
+    }
+    printf("[Debug]网络解禁完成\n");
+}
+
+//-----------------------------
 void hSysUlocker(){
+	UnlockSystemPrograms();
+	RemoveUSBRestrictions();
+	RemoveNetworkRestrictions();
+	printf("\n[Debug]全部操作执行完毕\n");
+	/*old
 	HKEY hKey;
 	RegOpenKeyExA(HKEY_CURRENT_USER,"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",0, KEY_SET_VALUE, &hKey);
 	RegDeleteValueA(hKey, "DisableCMD");
@@ -161,6 +492,7 @@ void hSysUlocker(){
 	system("cmd /c reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /v NoTrayContextMenu /f");
 	system("cmd /c reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /v DisallowLock /f");
 	system("cmd /c reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /v NoLogOff /f");
+	*/
 }
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
 {
@@ -169,15 +501,36 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show)
     (void)cmdLine;
     (void)show;
     hSysUlocker();
+    
+    if (!IsAdmin())
+	{
+	    int nRet = MessageBoxW(NULL,
+	        L"当前未使用管理员权限运行，部分操作可能会执行失败，\n是否尝试提权？",
+	        L"警告",
+	        MB_YESNO | MB_ICONQUESTION);
+	
+	    if(nRet == IDYES)
+	    {
+	        ElevateSelf();
+	        return 1; 
+	    }
+	}
+	
+	hSysUlocker();
     const wchar_t *targetExe = L"zmserv.exe";
 
     if (!EnableDebugPrivilege())
     {
-        MessageBoxW(NULL,
-            L"启用 SeDebugPrivilege 失败！\n请以管理员身份运行！",
-            L"错误",
-            MB_ICONERROR);
-        return 1;
+     int nRet = MessageBoxW(NULL,
+	        L"启用 SeDebugPrivilege 失败！\n无管理员权限将无法继续操作! \n \n是否立即尝试提权？",
+			L"错误",
+	        MB_YESNO | MB_ICONERROR);
+	
+	    if(nRet == IDYES)
+	    {
+	        ElevateSelf();
+	    }
+	    return 1;
     }
 
     DWORD rootPid = FindRootPid(targetExe);

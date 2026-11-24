@@ -6,7 +6,7 @@
 
 重要事项：
 目前仅支持Windows 10及以上系统直接运行。
-Windows 7系统可以尝试在资源管理器的地址栏输入[taskkill /f /fi "USERNAME eq %username%"](不要把中括号[]也输入进去了)，
+Windows 7系统可以尝试在资源管理器的地址栏输入{taskkill /f /fi "USERNAME eq %username%"}(不要把大括号{}也输入进去了)，
 随后按下ctrl+shift+esc或ctrl+alt+del打开任务管理器，运行"explorer.exe"，
 随后打开资源管理器窗口，在资源管理器的地址栏输入"services.msc"，回车确定，
 在弹出的服务窗口中往下滑找到"zmserv"，将其安全停止，
